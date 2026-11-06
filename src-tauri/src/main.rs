@@ -5,6 +5,7 @@
 //! Passwords never cross into the web view. The UI only receives account
 //! metadata; copy/login commands read the password on the Rust side.
 
+mod diagnostic;
 mod login_control;
 mod refresh;
 mod scale;
@@ -12,6 +13,7 @@ mod updater;
 mod views;
 
 use leagueaccounts::account_manager::KEYRING_SERVICE;
+use diagnostic::Stage;
 use leagueaccounts::autotype::auto_type_credentials;
 use leagueaccounts::credentials;
 use leagueaccounts::logging::{self, Event, Reason};
@@ -159,6 +161,7 @@ fn settings_view(app: &AppHandle, state: &Shared) -> SettingsView {
 
 #[tauri::command]
 fn bootstrap(app: AppHandle, state: AppState<'_>) -> CommandResult<Bootstrap> {
+    diagnostic::checkpoint(Stage::BootstrapCalled);
     Ok(Bootstrap {
         accounts: views(&state)?,
         regions: REGION_MAP
@@ -681,25 +684,52 @@ fn square_corners(window: &tauri::WebviewWindow) {
 }
 
 fn main() {
+    // This is intentionally the first action in main: trace failures before
+    // the normal logger or Tauri window can initialize.
+    diagnostic::init();
     logging::install_panic_hook();
+    let safe_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        diagnostic::checkpoint(Stage::Panic);
+        safe_panic_hook(info);
+    }));
     // A logging failure must not prevent users from opening their accounts.
-    let _ = logging::init();
+    diagnostic::checkpoint(if logging::init().is_ok() {
+        Stage::CoreLogReady
+    } else {
+        Stage::CoreLogUnavailable
+    });
+    diagnostic::checkpoint(Stage::UpdateCleanupBegin);
     updater::finish_previous_update();
+    diagnostic::checkpoint(Stage::UpdateCleanupComplete);
 
+    diagnostic::checkpoint(Stage::ManagerInitBegin);
     let provider: Arc<dyn RankProvider> = Arc::new(RankFetcher::new());
     let mut manager = match AccountManager::new(provider) {
-        Ok(manager) => manager,
+        Ok(manager) => {
+            diagnostic::checkpoint(Stage::ManagerInitComplete);
+            manager
+        }
         Err(_) => {
+            diagnostic::checkpoint(Stage::ManagerInitFailed);
             logging::record(Event::AppRunFailed, Reason::Storage);
             std::process::exit(1);
         }
     };
-    let load_error = manager
-        .load_accounts()
+    diagnostic::checkpoint(Stage::AccountsLoadBegin);
+    let load_result = manager.load_accounts();
+    diagnostic::checkpoint(if load_result.is_ok() {
+        Stage::AccountsLoadComplete
+    } else {
+        Stage::AccountsLoadFailed
+    });
+    let load_error = load_result
         .err()
         .map(|error| fail_with("load_failed", error));
+    diagnostic::checkpoint(Stage::SettingsLoadBegin);
     let settings_path = settings_file().ok();
     let mut settings = Settings::load(settings_path.as_ref());
+    diagnostic::checkpoint(Stage::SettingsLoadComplete);
     // Remember a mislabeled release across launches, not just this restart.
     if let Some(release) = updater::mislabeled_release() {
         settings.mislabeled_release = Some(release);
@@ -721,6 +751,7 @@ fn main() {
         load_error,
     });
 
+    diagnostic::checkpoint(Stage::TauriBuildBegin);
     let result = tauri::Builder::default()
         // Must come first. A second launch (shortcut, Start menu, autostart while the
         // app is already open) exits and brings this window back instead of opening
@@ -768,31 +799,47 @@ fn main() {
             open_logs_folder,
         ])
         .setup(move |app| {
+            diagnostic::checkpoint(Stage::SetupBegin);
             if let Some(window) = app.get_webview_window("main") {
+                diagnostic::checkpoint(Stage::WindowFound);
                 square_corners(&window);
                 // The window opens at its configured size, which is 100%.
                 scale::apply(&window, 100, ui_scale);
-                let _ = window.show();
+                diagnostic::checkpoint(if window.show().is_ok() {
+                    Stage::WindowShown
+                } else {
+                    Stage::WindowShowFailed
+                });
                 if start_minimized {
                     let _ = window.minimize();
                 } else {
                     let _ = window.set_focus();
                 }
+            } else {
+                diagnostic::checkpoint(Stage::WindowMissing);
             }
             spawn_scheduler(app.handle().clone(), Arc::clone(&shared));
-            updater::spawn(app.handle().clone(), Arc::clone(&shared));
+            // A support build must not self-update and replace itself.
+            if !diagnostic::enabled() {
+                updater::spawn(app.handle().clone(), Arc::clone(&shared));
+            }
+            diagnostic::checkpoint(Stage::SetupComplete);
             Ok(())
         })
         .build(tauri::generate_context!());
     let Ok(app) = result else {
+        diagnostic::checkpoint(Stage::TauriBuildFailed);
         logging::record(Event::AppRunFailed, Reason::Other);
         // Do not return the raw error to Rust's stderr termination handler.
         std::process::exit(1);
     };
+    diagnostic::checkpoint(Stage::TauriBuildComplete);
     // The event loop ends the process itself, so code after `run` never executes:
     // the last event is the only place to mark the end of the session.
+    diagnostic::checkpoint(Stage::EventLoopBegin);
     app.run(|_app, event| {
         if let tauri::RunEvent::Exit = event {
+            diagnostic::checkpoint(Stage::EventLoopExit);
             logging::record(Event::SessionEnded, Reason::None);
         }
     });
