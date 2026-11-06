@@ -1,0 +1,43 @@
+name: Diagnostic build (Windows)
+
+on:
+  push:
+    branches:
+      - diagnostic-startup-2026-11-06
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install dependencies
+        run: npm ci
+      - name: Compile diagnostic app
+        shell: pwsh
+        env:
+          LEAGUEACCOUNTS_DIAGNOSTICS: "1"
+        run: |
+          npm run build
+          npx tauri build --no-bundle
+      - name: Prepare portable diagnostic package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostic-dist | Out-Null
+          Copy-Item target/release/LeagueAccounts.exe diagnostic-dist/LeagueAccounts-Diagnostic.exe
+          Copy-Item scripts/Run-LeagueAccounts-Diagnostic.ps1 diagnostic-dist/
+          Copy-Item docs/diagnostic-startup.md diagnostic-dist/README.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeagueAccounts-Diagnostic-Windows
+          path: diagnostic-dist/
+          retention-days: 7
